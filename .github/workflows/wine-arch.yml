@@ -1,30 +1,145 @@
-name: Wine Arch Linux CI
+name: Build wine-tkg (Arch Linux)
 
 on:
-  schedule:
-    - cron:  '45 8,20 * * *'
+  push:
+    branches:
+      - main
+      - master
+    paths:
+      - "wine-tkg-git/customization.cfg"
+      - "wine-tkg-git/wine-tkg-profiles/advanced-customization.cfg"
+      - "wine-tkg-git/wine-tkg-userpatches/**"
+      - ".github/workflows/wine-arch.yml"
+
   workflow_dispatch:
 
+# ─────────────────────────────────────────────────────────────────────
+# Variables de entorno para el build
+# ─────────────────────────────────────────────────────────────────────
+env:
+  PKGDEST: "/tmp/wine-tkg"
+  XDG_CACHE_HOME: "/tmp/.cache"
+
 jobs:
-  build:
+  build-wine:
     runs-on: ubuntu-latest
     container: archlinux:latest
 
     steps:
-      - uses: actions/checkout@v4
-      - name: Compile
-        env:
-          XDG_CACHE_HOME: /tmp/.cache
-        run: |
-          echo -e "[multilib]\nInclude = /etc/pacman.d/mirrorlist" >> /etc/pacman.conf
-          pacman -Syu --noconfirm base-devel sudo
-          useradd user -G wheel && echo "user ALL=(ALL) NOPASSWD: ALL" >> /etc/sudoers
-          chown user -R . && cd wine-tkg-git
-          sed -i 's/wayland_driver="false"/wayland_driver="true"/' customization.cfg
-          su user -c "yes|PKGDEST=/tmp/wine-tkg makepkg --noconfirm -s"
+      # ── Step 1 ──────────────────────────────────────────────────────
+      # Instalar git antes del checkout
+      # ────────────────────────────────────────────────────────────────
+      - name: "1 · Install git"
+        run: pacman -Syu --noconfirm git
 
-      - name: Archive the artifacts
+      # ── Step 2 ──────────────────────────────────────────────────────
+      # Checkout del repo (contiene wine-tkg-git/ con tu customization.cfg)
+      # ────────────────────────────────────────────────────────────────
+      - name: "2 · Checkout repo"
+        uses: actions/checkout@v4
+
+      # ── Step 3 ──────────────────────────────────────────────────────
+      # Instalar dependencias y crear usuario no-root
+      # makepkg no corre como root
+      # ────────────────────────────────────────────────────────────────
+      - name: "3 · Install build dependencies and prepare non-root user"
+        run: |
+          # Habilitar multilib (necesario para wine 32-bit)
+          echo -e "[multilib]\nInclude = /etc/pacman.d/mirrorlist" >> /etc/pacman.conf
+          pacman -Syu --noconfirm \
+            base-devel sudo ccache \
+            lib32-gcc-libs lib32-glibc \
+            mingw-w64-gcc
+
+          # Crear usuario sin privilegios con sudo sin contraseña
+          useradd user -G wheel
+          echo "user ALL=(ALL) NOPASSWD: ALL" >> /etc/sudoers
+
+          # Dar ownership al workspace y /tmp
+          chown user -R ..
+          chown user -R /tmp
+
+      # ── Step 4 ──────────────────────────────────────────────────────
+      # Restaurar ccache para acelerar builds sucesivos
+      # ────────────────────────────────────────────────────────────────
+      - name: "4 · Restore ccache"
+        uses: actions/cache@v4
+        with:
+          path: /home/user/.ccache
+          key: ccache-wine-tkg-${{ github.sha }}
+          restore-keys: |
+            ccache-wine-tkg-
+
+      # ── Step 5 ──────────────────────────────────────────────────────
+      # Corregir ownership del ccache restaurado (actions/cache lo restaura como root)
+      # ────────────────────────────────────────────────────────────────
+      - name: "5 · Fix ccache ownership"
+        run: |
+          mkdir -p /home/user/.ccache
+          chown -R user /home/user/.ccache
+
+      # ── Step 6 ──────────────────────────────────────────────────────
+      # Compilar wine-tkg
+      # Corre desde wine-tkg-git/ donde está el PKGBUILD
+      # ────────────────────────────────────────────────────────────────
+      - name: "6 · Compile wine-tkg"
+        run: |
+          cd wine-tkg-git
+          su --preserve-environment user -c "yes '' | PKGDEST=${{ env.PKGDEST }} makepkg --noconfirm -s"
+
+      # ── Step 7 ──────────────────────────────────────────────────────
+      # Extraer versión del paquete compilado
+      # Ejemplo: wine-tkg-staging-fsync-git-9.22.r0.gf8c7109b-1-x86_64.pkg.tar.zst
+      # ────────────────────────────────────────────────────────────────
+      - name: "7 · Get wine version"
+        id: wver
+        run: |
+          PKG=$(find ${{ env.PKGDEST }} -name "wine*.pkg.tar.zst" \
+            ! -name "*lib32*" ! -name "*docs*" | head -n1)
+          echo "Package found: $PKG"
+
+          # Extraer versión (ej: 9.22.r0.gf8c7109b)
+          VERSION=$(basename "$PKG" | grep -oP '\d+\.\d+[^\-]*' | head -n1)
+
+          echo "version=$VERSION" >> $GITHUB_OUTPUT
+          echo "Wine version: $VERSION"
+
+      # ── Step 8 ──────────────────────────────────────────────────────
+      # Subir artefactos (accesibles desde la página del run de Actions)
+      # ────────────────────────────────────────────────────────────────
+      - name: "8 · Upload artifacts"
         uses: actions/upload-artifact@v4
         with:
-          name: wine-tkg-build
-          path: /tmp/wine-tkg
+          name: wine-tkg-arch-${{ steps.wver.outputs.version }}
+          path: ${{ env.PKGDEST }}/wine*.pkg.tar.zst
+
+      # ── Step 9 ──────────────────────────────────────────────────────
+      # Crear GitHub Release con los paquetes adjuntos
+      # Usa softprops/action-gh-release — no requiere gh CLI en el contenedor
+      # ────────────────────────────────────────────────────────────────
+      - name: "9 · Create GitHub Release"
+        if: github.event_name == 'push' || github.event_name == 'workflow_dispatch'
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: "wine-tkg-${{ steps.wver.outputs.version }}"
+          name: "wine-tkg ${{ steps.wver.outputs.version }} · staging · silvermont (Arch)"
+          body: |
+            ## wine-tkg ${{ steps.wver.outputs.version }}
+
+            ### Configuración
+            | Opción | Valor |
+            |---|---|
+            | Base | wine-staging |
+            | fsync | habilitado |
+            | Wayland driver | habilitado |
+            | Target | Arch Linux x86_64 |
+
+            ### Instalación
+            ```bash
+            sudo pacman -U wine-tkg-*.pkg.tar.zst
+            ```
+
+            > Compilado automáticamente con GitHub Actions desde [wine-tkg-git](https://github.com/Frogging-Family/wine-tkg-git).
+          files: ${{ env.PKGDEST }}/wine*.pkg.tar.zst
+          make_latest: false
+          fail_on_unmatched_files: false
